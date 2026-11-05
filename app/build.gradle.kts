@@ -56,6 +56,11 @@ android {
         buildConfig = true
     }
 
+    // Critical for MediaPipe / TFLite: prevents APK compression so the model can be memory-mapped
+    androidResources {
+        noCompress += listOf("tflite", "lite", "task")
+    }
+
     packaging {
         resources {
             excludes += listOf(
@@ -75,6 +80,33 @@ android {
     }
 }
 
+// Automatically downloads magic_touch.tflite into src/main/assets/ during build if missing
+tasks.register("downloadMagicTouchModel") {
+    doLast {
+        val assetsDir = file("src/main/assets")
+        if (!assetsDir.exists()) {
+            assetsDir.mkdirs()
+        }
+        val modelFile = file("src/main/assets/magic_touch.tflite")
+        if (!modelFile.exists() || modelFile.length() < 100_000L) {
+            println("Downloading magic_touch.tflite from Google MediaPipe storage...")
+            val modelUrl = "https://storage.googleapis.com/mediapipe-models/interactive_segmenter/magic_touch/float32/1/magic_touch.tflite"
+            java.net.URI(modelUrl).toURL().openStream().use { input ->
+                modelFile.outputStream().use { output ->
+                    input.copyTo(output)
+                }
+            }
+            println("✓ magic_touch.tflite downloaded (${modelFile.length() / 1024} KB)")
+        } else {
+            println("✓ magic_touch.tflite already present (${modelFile.length() / 1024} KB)")
+        }
+    }
+}
+
+tasks.named("preBuild") {
+    dependsOn("downloadMagicTouchModel")
+}
+
 dependencies {
     implementation("androidx.core:core-ktx:1.12.0")
     implementation("androidx.appcompat:appcompat:1.6.1")
@@ -86,7 +118,10 @@ dependencies {
     implementation("com.google.ar:core:1.41.0")
     implementation("io.github.sceneview:arsceneview:2.2.1")
 
-    // Networking for DeepSeek VLM
+    // MediaPipe Tasks Vision for InteractiveSegmenter (magic_touch.tflite)
+    implementation("com.google.mediapipe:tasks-vision:0.10.14")
+
+    // Networking for Modal Batch Upload
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
 
     testImplementation("junit:junit:4.13.2")
