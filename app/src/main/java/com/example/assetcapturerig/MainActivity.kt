@@ -24,6 +24,14 @@ import com.google.ar.core.Frame
 import com.google.ar.core.Plane
 import com.google.ar.core.Pose
 import com.google.ar.core.TrackingState
+import com.google.mediapipe.framework.image.BitmapImageBuilder
+import com.google.mediapipe.framework.image.ByteBufferExtractor
+import com.google.mediapipe.framework.image.MPImage
+import com.google.mediapipe.tasks.components.containers.NormalizedKeypoint
+import com.google.mediapipe.tasks.core.BaseOptions
+import com.google.mediapipe.tasks.vision.imagesegmenter.ImageSegmenterResult
+import com.google.mediapipe.tasks.vision.interactivesegmenter.InteractiveSegmenter
+import com.google.mediapipe.tasks.vision.interactivesegmenter.InteractiveSegmenter.InteractiveSegmenterOptions
 import io.github.sceneview.ar.ARSceneView
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
@@ -31,11 +39,20 @@ import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
 import java.io.File
 import java.io.FileOutputStream
+import java.nio.ByteBuffer
 import java.util.ArrayDeque
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import kotlin.math.*
 
 class MainActivity : AppCompatActivity() {
+
+    private val modalEndpoint = "https://emmanuelnwalema--mobile-6dof-capture-ui.modal.run/upload_plate"
+    private val httpClient = OkHttpClient.Builder()
+        .connectTimeout(15, TimeUnit.SECONDS)
+        .writeTimeout(20, TimeUnit.SECONDS)
+        .readTimeout(20, TimeUnit.SECONDS)
+        .build()
 
     private lateinit var rootLayout: FrameLayout
     private lateinit var sceneView: ARSceneView
@@ -69,11 +86,12 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullPreviewLabel: TextView
     private lateinit var closePreviewBtn: Button
 
-    private val httpClient = OkHttpClient()
-    private val modalEndpoint = "https://emmanuelnwalema--mobile-6dof-capture-ui.modal.run/upload_plate"
-
-    private val debugLog = StringBuilder("App Initialized (3D Encapsulating Ring Engine)\n")
+    private val debugLog = StringBuilder("App Initialized (3D Ring Cling + MagicTouch Engine)\n")
     private var toneGen: ToneGenerator? = null
+
+    // MediaPipe Interactive Segmenter (magic_touch.tflite)
+    private var interactiveSegmenter: InteractiveSegmenter? = null
+    private val modelAssetName = "magic_touch.tflite"
 
     private var currentStepIdx = 0
     private var isBoxPlaced = false
@@ -90,7 +108,7 @@ class MainActivity : AppCompatActivity() {
     private var prismHeight = 0.05f
 
     // =========================================================
-    // 3D ENCAPSULATING RING LIVE STATE
+    // 3D ENCAPSULATING RING LIVE CLING STATE (PRE-LOCK)
     // =========================================================
     private var hasLiveCling = false
     private var liveClingConfidence = 0
@@ -179,6 +197,8 @@ class MainActivity : AppCompatActivity() {
             toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
         } catch (e: Exception) {}
 
+        initMediaPipeSegmenter()
+
         overlayView = PrismOverlayView(this)
         rootLayout.addView(overlayView, 1)
 
@@ -244,6 +264,13 @@ class MainActivity : AppCompatActivity() {
         updateScaleLabels()
     }
 
+    override fun onDestroy() {
+        super.onDestroy()
+        try {
+            interactiveSegmenter?.close()
+        } catch (e: Exception) {}
+    }
+
     private fun logDebug(msg: String) {
         Log.d("RigDebug", msg)
         debugLog.append("[${System.currentTimeMillis() % 100000}] $msg\n")
@@ -261,12 +288,32 @@ class MainActivity : AppCompatActivity() {
             }
             val sv = ScrollView(this).apply { addView(tv) }
             AlertDialog.Builder(this)
-                .setTitle("3D Encapsulating Ring Diagnostics")
+                .setTitle("3D Ring + MagicTouch Diagnostics")
                 .setView(sv)
                 .setPositiveButton("OK", null)
                 .setNeutralButton("Clear") { _, _ -> debugLog.clear() }
                 .show()
         }
+    }
+
+    private fun initMediaPipeSegmenter() {
+        Thread {
+            try {
+                logDebug("Loading MediaPipe asset: $modelAssetName...")
+                val baseOptions = BaseOptions.builder()
+                    .setModelAssetPath(modelAssetName)
+                    .build()
+                val options = InteractiveSegmenterOptions.builder()
+                    .setBaseOptions(baseOptions)
+                    .setOutputCategoryMask(true)
+                    .setOutputConfidenceMasks(false)
+                    .build()
+                interactiveSegmenter = InteractiveSegmenter.createFromOptions(this, options)
+                logDebug("✓ MagicTouch InteractiveSegmenter Ready!")
+            } catch (e: Exception) {
+                logDebug("❌ MagicTouch Init Failed: ${e.javaClass.simpleName}: ${e.message}")
+            }
+        }.start()
     }
 
     private fun buildThumbnailStrip() {
@@ -358,19 +405,8 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // OUTSIDE-IN SILHOUETTE DETECTOR & 3D ENCAPSULATING RING ENGINE
+    // PHASE 1: OUTSIDE-IN SILHOUETTE DETECTOR & 3D ENCAPSULATING RING (PRE-LOCK)
     // =========================================================================
-    /**
-     * Captures the ENTIRE outer silhouette of the asset (never getting trapped inside
-     * specular reflections or internal box graphics) by:
-     * 1. Determining the 1D background stripe orientation from the outer border frame.
-     * 2. Predicting the background color at every interior cell by projecting along the
-     *    stripe axis to the outer border ring.
-     * 3. Combining along-stripe residual + cross-stripe edge damming + outer-border flood fill
-     *    so any internal hole (glare, logos, camera bars) is filled solid inside the outer boundary.
-     * 4. Unprojecting the 2D silhouette at the asset's 3D mid-height plane (planeY + H/2) so the
-     *    3D encapsulating ring wraps around the entire asset in perspective.
-     */
     private fun updateLiveClingReticle(frame: Frame, planeHitPose: Pose) {
         val sWidth = sceneView.width.toFloat()
         val sHeight = sceneView.height.toFloat()
@@ -465,14 +501,12 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // Gradient angle is perpendicular to stripes; stripe direction is gradAngle + PI/2
             val gradAngle = 0.5f * atan2(2f * jxy, jxx - jyy)
             val stripeAngle = gradAngle + (Math.PI / 2.0).toFloat()
             val sCos = cos(stripeAngle)
             val sSin = sin(stripeAngle)
 
-            // 2. For every interior cell (gx, gy), trace along +s and -s to the outer border ring
-            //    to predict the exact stripe color passing behind (gx, gy).
+            // 2. Along-stripe border projection to cancel background stripes
             val rawFg = BooleanArray(numGrid)
 
             for (gy in 2 until gridN - 2) {
@@ -482,7 +516,6 @@ class MainActivity : AppCompatActivity() {
                     val pu = cellU[g]
                     val pv = cellV[g]
 
-                    // Ray-march to border in +s and -s directions
                     var tPos = 1f
                     var b1x = gx; var b1y = gy
                     while (tPos < gridN) {
@@ -509,7 +542,6 @@ class MainActivity : AppCompatActivity() {
                         tNeg += 1f
                     }
 
-                    // Compare (py, pu, pv) against a 3x3 patch around both border stripe endpoints
                     var minStripeDiff = Int.MAX_VALUE
                     for (oy in -1..1) {
                         for (ox in -1..1) {
@@ -527,7 +559,6 @@ class MainActivity : AppCompatActivity() {
                             val dSq = if (isSoftShadow) 0 else (dy * dy + du * du + dv * dv)
                             if (dSq < minStripeDiff) minStripeDiff = dSq
 
-                            // Also check single-ended border match in case object touches one side
                             val dy1 = py - cellY[idx1]
                             val du1 = (pu - cellU[idx1]) * 2
                             val dv1 = (pv - cellV[idx1]) * 2
@@ -536,7 +567,6 @@ class MainActivity : AppCompatActivity() {
                         }
                     }
 
-                    // Derivative ALONG the stripe direction (zero on background stripes, high on object edges)
                     val sxStep = sCos.roundToInt().coerceIn(-1, 1)
                     val syStep = sSin.roundToInt().coerceIn(-1, 1)
                     val gFwd = (gy + syStep) * gridN + (gx + sxStep)
@@ -548,8 +578,7 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // 3. Morphological Closing (3x3 Dilation) + Outer-Border Background Flood Fill
-            //    so any internal patches inside the asset (glare, logos, matching stripe tone) are filled solid!
+            // 3. Morphological Closing + Outer-Border Flood Fill for solid silhouette
             val dilatedFg = BooleanArray(numGrid)
             for (gy in 2 until gridN - 2) {
                 for (gx in 2 until gridN - 2) {
@@ -563,7 +592,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // Flood-fill "Outside Background" starting from all perimeter cells (gx <= 1 or gy <= 1 etc.)
             val outsideBg = BooleanArray(numGrid)
             val bgQueue = ArrayDeque<Int>()
             for (gy in 0 until gridN) {
@@ -594,7 +622,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // Any cell NOT reached by the outside background flood is part of the solid closed object silhouette!
             val solidSilhouette = BooleanArray(numGrid)
             for (gy in 2 until gridN - 2) {
                 for (gx in 2 until gridN - 2) {
@@ -604,12 +631,10 @@ class MainActivity : AppCompatActivity() {
                             if (!outsideBg[(gy + ky) * gridN + (gx + kx)]) nonBgNeighbors++
                         }
                     }
-                    // Erode 1px back to undo the dilation margin and prune thin 1D noise
                     solidSilhouette[gy * gridN + gx] = nonBgNeighbors >= 5
                 }
             }
 
-            // 4. Extract the connected object component closest to the aiming center
             val centerG = gridN / 2
             var seedIdx = -1
             var bestDist = Int.MAX_VALUE
@@ -677,7 +702,6 @@ class MainActivity : AppCompatActivity() {
             val barX = sumX / count
             val barY = sumY / count
 
-            // 5. Rotating Calipers Minimum-Area Bounding Box in screen space
             var bestArea = Float.MAX_VALUE
             var bestRad = 0f
             for (deg in 0 until 90 step 3) {
@@ -732,8 +756,6 @@ class MainActivity : AppCompatActivity() {
             val boxScreenCX = barX + midU * uX + midV * vX
             val boxScreenCY = barY + midU * uY + midV * vY
 
-            // 6. Unproject the 2D silhouette at the asset's 3D MID-HEIGHT plane (planeY + H/2)
-            //    so the 3D encapsulating ring is centered directly over the asset in perspective!
             val vMat = FloatArray(16)
             val pMat = FloatArray(16)
             val vpMat = FloatArray(16)
@@ -881,6 +903,9 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    // =========================================================================
+    // PHASE 2: LOCK HANDOFF + MAGICTOUCH INTERACTIVE SEGMENTER REFINEMENT
+    // =========================================================================
     private fun placePrismAtHitTest() {
         val frame = lastFrame ?: return
         val session = sceneView.session ?: return
@@ -893,6 +918,8 @@ class MainActivity : AppCompatActivity() {
 
         if (firstHit != null) {
             val hitPose = firstHit.hitPose
+            val seedScreenX: Float
+            val seedScreenY: Float
 
             if (hasLiveCling) {
                 val clingPose = Pose(
@@ -904,11 +931,13 @@ class MainActivity : AppCompatActivity() {
                 prismDepth = liveDepth
                 prismHeight = liveHeight
                 initialAzimuth = liveAzimuth
+                seedScreenX = liveClingScreenX
+                seedScreenY = liveClingScreenY
 
                 val wCm = (prismWidth * 100).roundToInt()
                 val dCm = (prismDepth * 100).roundToInt()
                 val hCm = (prismHeight * 100).roundToInt()
-                logDebug("✓ Locked 3D Encapsulating Ring Fit: ${wCm}x${dCm}x${hCm}cm")
+                logDebug("✓ Locked 3D Ring Seed: ${wCm}x${dCm}x${hCm}cm")
             } else {
                 val anchor = firstHit.createAnchor()
                 prismAnchor = anchor
@@ -916,9 +945,41 @@ class MainActivity : AppCompatActivity() {
                 val anchorPose = anchor.pose
                 val camInAnchor = anchorPose.inverse().transformPoint(floatArrayOf(camPose.tx(), camPose.ty(), camPose.tz()))
                 initialAzimuth = atan2(camInAnchor[0], camInAnchor[2])
+                seedScreenX = sceneView.width / 2f
+                seedScreenY = sceneView.height / 2f
             }
 
             isBoxPlaced = true
+
+            // Trigger MagicTouch (magic_touch.tflite) neural segmentation using the clinging seed point
+            val currentAnchor = prismAnchor
+            if (currentAnchor != null) {
+                val vMat = FloatArray(16)
+                val pMat = FloatArray(16)
+                val vpMat = FloatArray(16)
+                val invVpMat = FloatArray(16)
+
+                frame.camera.getViewMatrix(vMat, 0)
+                frame.camera.getProjectionMatrix(pMat, 0, 0.05f, 50.0f)
+                Matrix.multiplyMM(vpMat, 0, pMat, 0, vMat, 0)
+                Matrix.invertM(invVpMat, 0, vpMat, 0)
+
+                val snapshotAnchorPose = currentAnchor.pose
+                val camPose = frame.camera.pose
+                val camInAnchor = snapshotAnchorPose.inverse().transformPoint(
+                    floatArrayOf(camPose.tx(), camPose.ty(), camPose.tz())
+                )
+                val camAngle = atan2(camInAnchor[0], camInAnchor[2])
+
+                runMagicTouchPipeline(
+                    invVpMat,
+                    snapshotAnchorPose,
+                    camAngle,
+                    seedScreenX,
+                    seedScreenY,
+                    prismHeight
+                )
+            }
 
             actionButton.visibility = View.GONE
             scaleBar.visibility = View.VISIBLE
@@ -935,6 +996,378 @@ class MainActivity : AppCompatActivity() {
             } catch (e: Exception) {}
         } else {
             Toast.makeText(this, "Aim reticle at table surface first", Toast.LENGTH_SHORT).show()
+        }
+    }
+
+    private fun runMagicTouchPipeline(
+        invVpMatrix: FloatArray,
+        snapshotAnchorPose: Pose,
+        camAngle: Float,
+        seedScreenX: Float,
+        seedScreenY: Float,
+        seedHeightM: Float
+    ) {
+        val sWidth = sceneView.width
+        val sHeight = sceneView.height
+        if (sWidth <= 0 || sHeight <= 0) return
+
+        val bitmap = Bitmap.createBitmap(sWidth, sHeight, Bitmap.Config.ARGB_8888)
+        PixelCopy.request(
+            sceneView as SurfaceView,
+            bitmap,
+            PixelCopy.OnPixelCopyFinishedListener { copyResult ->
+                if (copyResult == PixelCopy.SUCCESS) {
+                    Thread {
+                        val segmenter = interactiveSegmenter
+                        if (segmenter == null) {
+                            logDebug("⚠️ MagicTouch not initialized yet — keeping 3D Ring lock")
+                            return@Thread
+                        }
+
+                        try {
+                            val startMs = System.currentTimeMillis()
+
+                            // Crop a 1:1 square centered on the viewport for aspect-accurate neural inference
+                            val minDim = min(bitmap.width, bitmap.height)
+                            val cropX = (bitmap.width - minDim) / 2f
+                            val cropY = (bitmap.height - minDim) / 2f
+                            val squareBmp = Bitmap.createBitmap(
+                                bitmap,
+                                cropX.toInt(),
+                                cropY.toInt(),
+                                minDim,
+                                minDim
+                            )
+
+                            val normKeyX = ((seedScreenX - cropX) / minDim).coerceIn(0.15f, 0.85f)
+                            val normKeyY = ((seedScreenY - cropY) / minDim).coerceIn(0.15f, 0.85f)
+
+                            val mpImage: MPImage = BitmapImageBuilder(squareBmp).build()
+                            val roi = InteractiveSegmenter.RegionOfInterest.create(
+                                NormalizedKeypoint.create(normKeyX, normKeyY)
+                            )
+
+                            val result: ImageSegmenterResult? = segmenter.segment(mpImage, roi)
+                            val maskOpt = result?.categoryMask()
+
+                            if (maskOpt != null && maskOpt.isPresent) {
+                                val maskImage = maskOpt.get()
+                                val latencyMs = System.currentTimeMillis() - startMs
+                                logDebug("MagicTouch inference: ${latencyMs}ms (${maskImage.width}x${maskImage.height})")
+
+                                projectMagicTouchMaskAndOrient(
+                                    maskImage,
+                                    cropX,
+                                    cropY,
+                                    minDim.toFloat(),
+                                    normKeyX,
+                                    normKeyY,
+                                    invVpMatrix,
+                                    snapshotAnchorPose,
+                                    camAngle,
+                                    seedHeightM,
+                                    sWidth,
+                                    sHeight
+                                )
+                            } else {
+                                logDebug("⚠️ MagicTouch returned empty categoryMask")
+                            }
+                            result?.close()
+                        } catch (e: Exception) {
+                            logDebug("❌ MagicTouch Exception: ${e.javaClass.simpleName}: ${e.message}")
+                        }
+                    }.start()
+                }
+            },
+            Handler(Looper.getMainLooper())
+        )
+    }
+
+    /**
+     * Extracts the binary foreground mask from MagicTouch's MPImage, runs a 1° Rotating-Calipers
+     * minimum-area bounding box sweep, unprojects at the asset's 3D mid-height plane (planeY + H/2),
+     * and refines the 3D anchor & prism dimensions.
+     */
+    private fun projectMagicTouchMaskAndOrient(
+        maskImage: MPImage,
+        cropX: Float,
+        cropY: Float,
+        minDim: Float,
+        normKeyX: Float,
+        normKeyY: Float,
+        invVpMatrix: FloatArray,
+        snapshotAnchorPose: Pose,
+        camAngle: Float,
+        seedHeightM: Float,
+        sWidth: Int,
+        sHeight: Int
+    ) {
+        val mW = maskImage.width
+        val mH = maskImage.height
+        val byteBuf: ByteBuffer = ByteBufferExtractor.extract(maskImage)
+        byteBuf.rewind()
+
+        val rawBytes = ByteArray(mW * mH)
+        byteBuf.get(rawBytes)
+
+        // Determine outer perimeter background category value (almost always 0)
+        var zeroBorderCount = 0
+        var nonZeroBorderCount = 0
+        for (x in 0 until mW step 4) {
+            if ((rawBytes[x].toInt() and 0xFF) == 0) zeroBorderCount++ else nonZeroBorderCount++
+            if ((rawBytes[(mH - 1) * mW + x].toInt() and 0xFF) == 0) zeroBorderCount++ else nonZeroBorderCount++
+        }
+        val bgCategoryIsZero = zeroBorderCount >= nonZeroBorderCount
+
+        // Downsample mask onto a fast 128x128 grid to extract the connected component under the keypoint
+        val gSize = 128
+        val gridMask = BooleanArray(gSize * gSize)
+        for (gy in 1 until gSize - 1) {
+            val my = (gy * mH) / gSize
+            val rowOff = my * mW
+            for (gx in 1 until gSize - 1) {
+                val mx = (gx * mW) / gSize
+                val v = rawBytes[rowOff + mx].toInt() and 0xFF
+                gridMask[gy * gSize + gx] = if (bgCategoryIsZero) (v > 0) else (v == 0)
+            }
+        }
+
+        val seedGX = (normKeyX * gSize).toInt().coerceIn(4, gSize - 5)
+        val seedGY = (normKeyY * gSize).toInt().coerceIn(4, gSize - 5)
+        var startIdx = -1
+        var bestSeedDist = Int.MAX_VALUE
+
+        for (gy in (seedGY - 12).coerceAtLeast(2)..(seedGY + 12).coerceAtMost(gSize - 3)) {
+            for (gx in (seedGX - 12).coerceAtLeast(2)..(seedGX + 12).coerceAtMost(gSize - 3)) {
+                val idx = gy * gSize + gx
+                if (gridMask[idx]) {
+                    val d = (gx - seedGX) * (gx - seedGX) + (gy - seedGY) * (gy - seedGY)
+                    if (d < bestSeedDist) {
+                        bestSeedDist = d
+                        startIdx = idx
+                    }
+                }
+            }
+        }
+
+        if (startIdx == -1) {
+            logDebug("⚠️ MagicTouch mask had no foreground near seed")
+            return
+        }
+
+        val visited = BooleanArray(gSize * gSize)
+        val queue = ArrayDeque<Int>()
+        queue.add(startIdx)
+        visited[startIdx] = true
+
+        val fgScreenX = mutableListOf<Float>()
+        val fgScreenY = mutableListOf<Float>()
+        var sumX = 0f
+        var sumY = 0f
+
+        while (!queue.isEmpty()) {
+            val curr = queue.removeFirst()
+            val cx = curr % gSize
+            val cy = curr / gSize
+
+            val sx = cropX + ((cx + 0.5f) / gSize) * minDim
+            val sy = cropY + ((cy + 0.5f) / gSize) * minDim
+            fgScreenX.add(sx)
+            fgScreenY.add(sy)
+            sumX += sx
+            sumY += sy
+
+            for (ny in (cy - 1)..(cy + 1)) {
+                for (nx in (cx - 1)..(cx + 1)) {
+                    if (nx in 1 until (gSize - 1) && ny in 1 until (gSize - 1)) {
+                        val nIdx = ny * gSize + nx
+                        if (gridMask[nIdx] && !visited[nIdx]) {
+                            visited[nIdx] = true
+                            queue.add(nIdx)
+                        }
+                    }
+                }
+            }
+        }
+
+        val count = fgScreenX.size
+        if (count < 25 || count > (gSize * gSize * 0.78f).toInt()) {
+            logDebug("⚠️ MagicTouch component out of bounds ($count cells) — keeping 3D Ring lock")
+            return
+        }
+
+        val barX = sumX / count
+        val barY = sumY / count
+
+        // 1° Rotating-Calipers Minimum-Area Bounding Box sweep on the neural mask
+        var bestArea = Float.MAX_VALUE
+        var bestRad = 0f
+
+        for (deg in 0 until 90) {
+            val rad = Math.toRadians(deg.toDouble()).toFloat()
+            val c = cos(rad)
+            val s = sin(rad)
+            var minU = Float.MAX_VALUE; var maxU = -Float.MAX_VALUE
+            var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
+
+            for (i in 0 until count) {
+                val dx = fgScreenX[i] - barX
+                val dy = fgScreenY[i] - barY
+                val pu = dx * c + dy * s
+                val pv = -dx * s + dy * c
+                if (pu < minU) minU = pu
+                if (pu > maxU) maxU = pu
+                if (pv < minV) minV = pv
+                if (pv > maxV) maxV = pv
+            }
+            val area = (maxU - minU).coerceAtLeast(10f) * (maxV - minV).coerceAtLeast(10f)
+            if (area < bestArea) {
+                bestArea = area
+                bestRad = rad
+            }
+        }
+
+        val uX = cos(bestRad)
+        val uY = sin(bestRad)
+        val vX = -uY
+        val vY = uX
+
+        var minU = Float.MAX_VALUE; var maxU = -Float.MAX_VALUE
+        var minV = Float.MAX_VALUE; var maxV = -Float.MAX_VALUE
+        for (i in 0 until count) {
+            val dx = fgScreenX[i] - barX
+            val dy = fgScreenY[i] - barY
+            val pu = dx * uX + dy * uY
+            val pv = dx * vX + dy * vY
+            if (pu < minU) minU = pu
+            if (pu > maxU) maxU = pu
+            if (pv < minV) minV = pv
+            if (pv > maxV) maxV = pv
+        }
+
+        val midU = (minU + maxU) * 0.5f
+        val midV = (minV + maxV) * 0.5f
+        val halfSpan1Px = ((maxU - minU) * 0.5f).coerceAtLeast(16f)
+        val halfSpan2Px = ((maxV - minV) * 0.5f).coerceAtLeast(16f)
+
+        val centerScreenX = barX + midU * uX + midV * vX
+        val centerScreenY = barY + midU * uY + midV * vY
+
+        val invSnapshotAnchor = snapshotAnchorPose.inverse()
+        val planeY = snapshotAnchorPose.ty()
+        val midPlaneY = planeY + seedHeightM * 0.5f
+
+        val pCenterMid = intersectScreenRayWithHorizontalPlane(centerScreenX, centerScreenY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, midPlaneY)
+        val p1AMid = intersectScreenRayWithHorizontalPlane(centerScreenX + halfSpan1Px * uX, centerScreenY + halfSpan1Px * uY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, midPlaneY)
+        val p1BMid = intersectScreenRayWithHorizontalPlane(centerScreenX - halfSpan1Px * uX, centerScreenY - halfSpan1Px * uY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, midPlaneY)
+        val p2AMid = intersectScreenRayWithHorizontalPlane(centerScreenX + halfSpan2Px * vX, centerScreenY + halfSpan2Px * vY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, midPlaneY)
+        val p2BMid = intersectScreenRayWithHorizontalPlane(centerScreenX - halfSpan2Px * vX, centerScreenY - halfSpan2Px * vY, sWidth.toFloat(), sHeight.toFloat(), invVpMatrix, midPlaneY)
+
+        if (pCenterMid == null || p1AMid == null || p1BMid == null || p2AMid == null || p2BMid == null) return
+
+        val pCenterTable = floatArrayOf(pCenterMid[0], planeY, pCenterMid[2])
+        val lCenter = invSnapshotAnchor.transformPoint(pCenterTable)
+        val l1A = invSnapshotAnchor.transformPoint(floatArrayOf(p1AMid[0], planeY, p1AMid[2]))
+        val l1B = invSnapshotAnchor.transformPoint(floatArrayOf(p1BMid[0], planeY, p1BMid[2]))
+        val l2A = invSnapshotAnchor.transformPoint(floatArrayOf(p2AMid[0], planeY, p2AMid[2]))
+        val l2B = invSnapshotAnchor.transformPoint(floatArrayOf(p2BMid[0], planeY, p2BMid[2]))
+
+        val v1X = l1A[0] - l1B[0]
+        val v1Z = l1A[2] - l1B[2]
+        val span1 = sqrt(v1X * v1X + v1Z * v1Z).coerceIn(0.04f, 0.45f)
+        val u1X = v1X / span1
+        val u1Z = v1Z / span1
+
+        val v2X = l2A[0] - l2B[0]
+        val v2Z = l2A[2] - l2B[2]
+        val span2 = sqrt(v2X * v2X + v2Z * v2Z).coerceIn(0.04f, 0.45f)
+        val u2X = v2X / span2
+        val u2Z = v2Z / span2
+
+        val camDirX = sin(camAngle)
+        val camDirZ = cos(camAngle)
+
+        val dot0 = u1X * camDirX + u1Z * camDirZ
+        val dot1 = -dot0
+        val dot2 = u2X * camDirX + u2Z * camDirZ
+        val dot3 = -dot2
+
+        val dots = floatArrayOf(dot0, dot1, dot2, dot3)
+        var bestIdx = 0
+        var maxDot = -Float.MAX_VALUE
+        for (i in 0 until 4) {
+            if (dots[i] > maxDot) {
+                maxDot = dots[i]
+                bestIdx = i
+            }
+        }
+
+        val margin = 1.06f
+        val finalWidth: Float
+        val finalDepth: Float
+        val headingAngle: Float
+
+        when (bestIdx) {
+            0 -> {
+                finalDepth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                finalWidth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(u1X, u1Z)
+            }
+            1 -> {
+                finalDepth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                finalWidth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(-u1X, -u1Z)
+            }
+            2 -> {
+                finalDepth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                finalWidth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(u2X, u2Z)
+            }
+            else -> {
+                finalDepth = (span2 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                finalWidth = (span1 * margin + 0.006f).coerceIn(0.04f, 0.45f)
+                headingAngle = atan2(-u2X, -u2Z)
+            }
+        }
+
+        runOnUiThread {
+            try {
+                val session = sceneView.session
+                val currentAnchor = prismAnchor
+                if (session != null && currentAnchor != null) {
+                    val curPose = currentAnchor.pose
+                    val deltaX = lCenter[0].coerceIn(-0.08f, 0.08f)
+                    val deltaZ = lCenter[2].coerceIn(-0.08f, 0.08f)
+                    val worldCenterNow = curPose.transformPoint(floatArrayOf(deltaX, 0f, deltaZ))
+                    currentAnchor.detach()
+                    val newCenterPose = Pose(
+                        floatArrayOf(worldCenterNow[0], curPose.ty(), worldCenterNow[2]),
+                        curPose.rotationQuaternion
+                    )
+                    prismAnchor = session.createAnchor(newCenterPose)
+                }
+            } catch (e: Exception) {
+                logDebug("Re-anchor failed: ${e.message}")
+            }
+
+            initialAzimuth = headingAngle
+            prismWidth = finalWidth
+            prismDepth = finalDepth
+
+            updateScaleLabels()
+            overlayView.postInvalidate()
+
+            val wCm = (prismWidth * 100).roundToInt()
+            val dCm = (prismDepth * 100).roundToInt()
+            val hCm = (prismHeight * 100).roundToInt()
+            val yawDeg = Math.toDegrees(headingAngle.toDouble()).roundToInt()
+
+            logDebug("✓ MagicTouch Refined: ${wCm}x${dCm}x${hCm}cm | Heading: ${yawDeg}°")
+            Toast.makeText(
+                this@MainActivity,
+                "✓ MagicTouch Locked: ${wCm}×${dCm}×${hCm}cm",
+                Toast.LENGTH_SHORT
+            ).show()
         }
     }
 
@@ -1435,8 +1868,6 @@ class MainActivity : AppCompatActivity() {
             // =========================================================================
             if (!isBoxPlaced) {
                 if (hasLiveCling) {
-                    // Circumscribing semi-axes (0.68x width/depth with superellipse contour)
-                    // so all 4 corners of rectangular boxes sit INSIDE the 3D ring!
                     val rx = (liveWidth * 0.68f).coerceIn(0.032f, 0.26f)
                     val rz = (liveDepth * 0.68f).coerceIn(0.032f, 0.26f)
                     val ringH = liveHeight.coerceIn(0.032f, 0.22f)
@@ -1451,7 +1882,6 @@ class MainActivity : AppCompatActivity() {
                         val ang = (2.0 * Math.PI * i / steps)
                         val c = cos(ang)
                         val s = sin(ang)
-                        // Gentle superellipse (exponent 0.82) rounds out corners while encapsulating boxes & cases
                         val lx = (rx * c.sign * abs(c).pow(0.82)).toFloat()
                         val lz = (rz * s.sign * abs(s).pow(0.82)).toFloat()
 
@@ -1462,7 +1892,6 @@ class MainActivity : AppCompatActivity() {
                     }
 
                     if (basePts.all { it != null } && topPts.all { it != null } && midPts.all { it != null }) {
-                        // 1. Translucent 3D Cylindrical Encapsulating Wall (connecting Base Ring y=0 to Top Ring y=H)
                         for (i in 0 until steps) {
                             val next = (i + 1) % steps
                             val quadPath = Path().apply {
@@ -1475,7 +1904,6 @@ class MainActivity : AppCompatActivity() {
                             canvas.drawPath(quadPath, webXrWallBandPaint)
                         }
 
-                        // 2. Vertical 3D Ring Ribs around the perimeter (every 20 degrees)
                         for (i in 0 until steps step 2) {
                             canvas.drawLine(
                                 basePts[i]!!.x, basePts[i]!!.y,
@@ -1484,13 +1912,11 @@ class MainActivity : AppCompatActivity() {
                             )
                         }
 
-                        // 3. Mid-Height Equatorial Track Ring (y = H/2)
                         for (i in 0 until steps step 2) {
                             val next = (i + 1) % steps
                             canvas.drawLine(midPts[i]!!.x, midPts[i]!!.y, midPts[next]!!.x, midPts[next]!!.y, webXrInnerRingPaint)
                         }
 
-                        // 4. Base Ring on the Table (y = 0) + Inner Gauge Ring
                         webXrRingPaint.color = Color.parseColor("#3FB950")
                         for (i in 0 until steps) {
                             val next = (i + 1) % steps
@@ -1500,7 +1926,6 @@ class MainActivity : AppCompatActivity() {
                             }
                         }
 
-                        // 5. Top Crown Ring (y = H) encapsulating the upper face of the asset
                         for (i in 0 until steps) {
                             val next = (i + 1) % steps
                             canvas.drawLine(topPts[i]!!.x, topPts[i]!!.y, topPts[next]!!.x, topPts[next]!!.y, webXrTopRingPaint)
@@ -1509,7 +1934,6 @@ class MainActivity : AppCompatActivity() {
                     return
                 }
 
-                // Default 3D ring when scanning empty table surface
                 val hitResults = frame.hitTest(screenW / 2f, screenH / 2f)
                 val hit = hitResults.firstOrNull()
                 if (hit != null) {
