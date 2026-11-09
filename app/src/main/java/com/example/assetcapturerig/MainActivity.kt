@@ -1,6 +1,7 @@
 package com.example.assetcapturerig
 
 import android.content.Context
+import android.content.res.AssetFileDescriptor
 import android.graphics.*
 import android.media.AudioManager
 import android.media.Image
@@ -24,22 +25,19 @@ import com.google.ar.core.Frame
 import com.google.ar.core.Plane
 import com.google.ar.core.Pose
 import com.google.ar.core.TrackingState
-import com.google.mediapipe.framework.image.BitmapImageBuilder
-import com.google.mediapipe.framework.image.ByteBufferExtractor
-import com.google.mediapipe.framework.image.MPImage
-import com.google.mediapipe.tasks.components.containers.NormalizedKeypoint
-import com.google.mediapipe.tasks.core.BaseOptions
-import com.google.mediapipe.tasks.vision.imagesegmenter.ImageSegmenterResult
-import com.google.mediapipe.tasks.vision.interactivesegmenter.InteractiveSegmenter
-import com.google.mediapipe.tasks.vision.interactivesegmenter.InteractiveSegmenter.InteractiveSegmenterOptions
 import io.github.sceneview.ar.ARSceneView
 import okhttp3.*
 import okhttp3.MediaType.Companion.toMediaType
 import okhttp3.RequestBody.Companion.toRequestBody
 import org.json.JSONObject
+import org.tensorflow.lite.DataType
+import org.tensorflow.lite.Interpreter
 import java.io.File
+import java.io.FileInputStream
 import java.io.FileOutputStream
 import java.nio.ByteBuffer
+import java.nio.ByteOrder
+import java.nio.channels.FileChannel
 import java.util.ArrayDeque
 import java.util.Locale
 import java.util.concurrent.TimeUnit
@@ -86,11 +84,10 @@ class MainActivity : AppCompatActivity() {
     private lateinit var fullPreviewLabel: TextView
     private lateinit var closePreviewBtn: Button
 
-    private val debugLog = StringBuilder("App Initialized (3D Ring Cling + MagicTouch Engine)\n")
+    private val debugLog = StringBuilder("App Initialized (3D Ring Cling + MagicTouch TFLite)\n")
     private var toneGen: ToneGenerator? = null
 
-    // MediaPipe Interactive Segmenter (magic_touch.tflite)
-    private var interactiveSegmenter: InteractiveSegmenter? = null
+    private var tfliteInterpreter: Interpreter? = null
     private val modelAssetName = "magic_touch.tflite"
 
     private var currentStepIdx = 0
@@ -197,7 +194,7 @@ class MainActivity : AppCompatActivity() {
             toneGen = ToneGenerator(AudioManager.STREAM_NOTIFICATION, 100)
         } catch (e: Exception) {}
 
-        initMediaPipeSegmenter()
+        initMagicTouchTFLite()
 
         overlayView = PrismOverlayView(this)
         rootLayout.addView(overlayView, 1)
@@ -267,7 +264,7 @@ class MainActivity : AppCompatActivity() {
     override fun onDestroy() {
         super.onDestroy()
         try {
-            interactiveSegmenter?.close()
+            tfliteInterpreter?.close()
         } catch (e: Exception) {}
     }
 
@@ -296,22 +293,26 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
-    private fun initMediaPipeSegmenter() {
+    private fun initMagicTouchTFLite() {
         Thread {
             try {
-                logDebug("Loading MediaPipe asset: $modelAssetName...")
-                val baseOptions = BaseOptions.builder()
-                    .setModelAssetPath(modelAssetName)
-                    .build()
-                val options = InteractiveSegmenterOptions.builder()
-                    .setBaseOptions(baseOptions)
-                    .setOutputCategoryMask(true)
-                    .setOutputConfidenceMasks(false)
-                    .build()
-                interactiveSegmenter = InteractiveSegmenter.createFromOptions(this, options)
-                logDebug("✓ MagicTouch InteractiveSegmenter Ready!")
+                logDebug("Loading TFLite asset: $modelAssetName...")
+                val fd: AssetFileDescriptor = assets.openFd(modelAssetName)
+                val inputStream = FileInputStream(fd.fileDescriptor)
+                val fileChannel = inputStream.channel
+                val modelBuffer = fileChannel.map(FileChannel.MapMode.READ_ONLY, fd.startOffset, fd.declaredLength)
+
+                val options = Interpreter.Options().apply {
+                    setNumThreads(4)
+                }
+                val interp = Interpreter(modelBuffer, options)
+                tfliteInterpreter = interp
+
+                val inShape = interp.getInputTensor(0).shape()
+                val outShape = interp.getOutputTensor(0).shape()
+                logDebug("✓ MagicTouch Ready!\nIn: ${inShape.contentToString()} (${interp.getInputTensor(0).dataType()})\nOut: ${outShape.contentToString()} (${interp.getOutputTensor(0).dataType()})")
             } catch (e: Exception) {
-                logDebug("❌ MagicTouch Init Failed: ${e.javaClass.simpleName}: ${e.message}")
+                logDebug("❌ MagicTouch Load Failed: ${e.javaClass.simpleName}: ${e.message}")
             }
         }.start()
     }
@@ -486,7 +487,6 @@ class MainActivity : AppCompatActivity() {
                 cellV[g] = vBuf.get(uvOff).toInt() and 0xFF
             }
 
-            // 1. Estimate dominant 1D background stripe direction from outer border structure tensor
             var jxx = 0f; var jyy = 0f; var jxy = 0f
             for (gy in 1 until gridN - 1) {
                 for (gx in 1 until gridN - 1) {
@@ -506,7 +506,6 @@ class MainActivity : AppCompatActivity() {
             val sCos = cos(stripeAngle)
             val sSin = sin(stripeAngle)
 
-            // 2. Along-stripe border projection to cancel background stripes
             val rawFg = BooleanArray(numGrid)
 
             for (gy in 2 until gridN - 2) {
@@ -578,7 +577,6 @@ class MainActivity : AppCompatActivity() {
                 }
             }
 
-            // 3. Morphological Closing + Outer-Border Flood Fill for solid silhouette
             val dilatedFg = BooleanArray(numGrid)
             for (gy in 2 until gridN - 2) {
                 for (gx in 2 until gridN - 2) {
@@ -904,7 +902,7 @@ class MainActivity : AppCompatActivity() {
     }
 
     // =========================================================================
-    // PHASE 2: LOCK HANDOFF + MAGICTOUCH INTERACTIVE SEGMENTER REFINEMENT
+    // PHASE 2: LOCK HANDOFF + MAGICTOUCH TFLITE INTERPRETER REFINEMENT
     // =========================================================================
     private fun placePrismAtHitTest() {
         val frame = lastFrame ?: return
@@ -951,7 +949,6 @@ class MainActivity : AppCompatActivity() {
 
             isBoxPlaced = true
 
-            // Trigger MagicTouch (magic_touch.tflite) neural segmentation using the clinging seed point
             val currentAnchor = prismAnchor
             if (currentAnchor != null) {
                 val vMat = FloatArray(16)
@@ -999,6 +996,11 @@ class MainActivity : AppCompatActivity() {
         }
     }
 
+    /**
+     * Runs magic_touch.tflite directly through org.tensorflow.lite.Interpreter:
+     * Feeds RGB + 4th-channel Gaussian point-prompt heatmap centered at (normKeyX, normKeyY),
+     * extracts the neural segmentation mask, and refines the 3D bounding prism.
+     */
     private fun runMagicTouchPipeline(
         invVpMatrix: FloatArray,
         snapshotAnchorPose: Pose,
@@ -1018,16 +1020,22 @@ class MainActivity : AppCompatActivity() {
             PixelCopy.OnPixelCopyFinishedListener { copyResult ->
                 if (copyResult == PixelCopy.SUCCESS) {
                     Thread {
-                        val segmenter = interactiveSegmenter
-                        if (segmenter == null) {
-                            logDebug("⚠️ MagicTouch not initialized yet — keeping 3D Ring lock")
+                        val interp = tfliteInterpreter
+                        if (interp == null) {
+                            logDebug("⚠️ MagicTouch TFLite not ready — keeping 3D Ring lock")
                             return@Thread
                         }
 
                         try {
                             val startMs = System.currentTimeMillis()
 
-                            // Crop a 1:1 square centered on the viewport for aspect-accurate neural inference
+                            val inTensor = interp.getInputTensor(0)
+                            val inShape = inTensor.shape() // Typically [1, 512, 512, 4]
+                            val inType = inTensor.dataType()
+                            val inH = if (inShape.size >= 3) inShape[1] else 512
+                            val inW = if (inShape.size >= 3) inShape[2] else 512
+                            val inC = if (inShape.size >= 4) inShape[3] else 4
+
                             val minDim = min(bitmap.width, bitmap.height)
                             val cropX = (bitmap.width - minDim) / 2f
                             val cropY = (bitmap.height - minDim) / 2f
@@ -1038,41 +1046,77 @@ class MainActivity : AppCompatActivity() {
                                 minDim,
                                 minDim
                             )
+                            val scaledBmp = Bitmap.createScaledBitmap(squareBmp, inW, inH, true)
 
                             val normKeyX = ((seedScreenX - cropX) / minDim).coerceIn(0.15f, 0.85f)
                             val normKeyY = ((seedScreenY - cropY) / minDim).coerceIn(0.15f, 0.85f)
+                            val keyPxX = normKeyX * inW
+                            val keyPxY = normKeyY * inH
+                            val invTwoSigmaSq = 1.0f / (2.0f * 12.0f * 12.0f)
 
-                            val mpImage: MPImage = BitmapImageBuilder(squareBmp).build()
-                            val roi = InteractiveSegmenter.RegionOfInterest.create(
-                                NormalizedKeypoint.create(normKeyX, normKeyY)
-                            )
-
-                            val result: ImageSegmenterResult? = segmenter.segment(mpImage, roi)
-                            val maskOpt = result?.categoryMask()
-
-                            if (maskOpt != null && maskOpt.isPresent) {
-                                val maskImage = maskOpt.get()
-                                val latencyMs = System.currentTimeMillis() - startMs
-                                logDebug("MagicTouch inference: ${latencyMs}ms (${maskImage.width}x${maskImage.height})")
-
-                                projectMagicTouchMaskAndOrient(
-                                    maskImage,
-                                    cropX,
-                                    cropY,
-                                    minDim.toFloat(),
-                                    normKeyX,
-                                    normKeyY,
-                                    invVpMatrix,
-                                    snapshotAnchorPose,
-                                    camAngle,
-                                    seedHeightM,
-                                    sWidth,
-                                    sHeight
-                                )
-                            } else {
-                                logDebug("⚠️ MagicTouch returned empty categoryMask")
+                            val inputBuffer = ByteBuffer.allocateDirect(inTensor.numBytes()).apply {
+                                order(ByteOrder.nativeOrder())
                             }
-                            result?.close()
+
+                            val intValues = IntArray(inW * inH)
+                            scaledBmp.getPixels(intValues, 0, inW, 0, 0, inW, inH)
+
+                            var pIdx = 0
+                            for (y in 0 until inH) {
+                                val dy = y - keyPxY
+                                for (x in 0 until inW) {
+                                    val px = intValues[pIdx++]
+                                    val r = (px shr 16) and 0xFF
+                                    val g = (px shr 8) and 0xFF
+                                    val b = px and 0xFF
+
+                                    val dx = x - keyPxX
+                                    val gauss = exp(-(dx * dx + dy * dy) * invTwoSigmaSq)
+
+                                    if (inType == DataType.FLOAT32) {
+                                        inputBuffer.putFloat(r / 255.0f)
+                                        inputBuffer.putFloat(g / 255.0f)
+                                        inputBuffer.putFloat(b / 255.0f)
+                                        if (inC >= 4) inputBuffer.putFloat(gauss)
+                                    } else {
+                                        inputBuffer.put(r.toByte())
+                                        inputBuffer.put(g.toByte())
+                                        inputBuffer.put(b.toByte())
+                                        if (inC >= 4) inputBuffer.put((gauss * 255f).toInt().coerceIn(0, 255).toByte())
+                                    }
+                                }
+                            }
+                            inputBuffer.rewind()
+
+                            val outTensor = interp.getOutputTensor(0)
+                            val outShape = outTensor.shape()
+                            val outType = outTensor.dataType()
+                            val outputBuffer = ByteBuffer.allocateDirect(outTensor.numBytes()).apply {
+                                order(ByteOrder.nativeOrder())
+                            }
+
+                            interp.run(inputBuffer, outputBuffer)
+                            outputBuffer.rewind()
+
+                            val latencyMs = System.currentTimeMillis() - startMs
+                            logDebug("MagicTouch TFLite: ${latencyMs}ms | Out:${outShape.contentToString()}")
+
+                            projectMagicTouchBufferAndOrient(
+                                outputBuffer,
+                                outShape,
+                                outType,
+                                cropX,
+                                cropY,
+                                minDim.toFloat(),
+                                normKeyX,
+                                normKeyY,
+                                invVpMatrix,
+                                snapshotAnchorPose,
+                                camAngle,
+                                seedHeightM,
+                                sWidth,
+                                sHeight
+                            )
                         } catch (e: Exception) {
                             logDebug("❌ MagicTouch Exception: ${e.javaClass.simpleName}: ${e.message}")
                         }
@@ -1083,13 +1127,10 @@ class MainActivity : AppCompatActivity() {
         )
     }
 
-    /**
-     * Extracts the binary foreground mask from MagicTouch's MPImage, runs a 1° Rotating-Calipers
-     * minimum-area bounding box sweep, unprojects at the asset's 3D mid-height plane (planeY + H/2),
-     * and refines the 3D anchor & prism dimensions.
-     */
-    private fun projectMagicTouchMaskAndOrient(
-        maskImage: MPImage,
+    private fun projectMagicTouchBufferAndOrient(
+        outputBuffer: ByteBuffer,
+        outShape: IntArray,
+        outType: DataType,
         cropX: Float,
         cropY: Float,
         minDim: Float,
@@ -1102,24 +1143,68 @@ class MainActivity : AppCompatActivity() {
         sWidth: Int,
         sHeight: Int
     ) {
-        val mW = maskImage.width
-        val mH = maskImage.height
-        val byteBuf: ByteBuffer = ByteBufferExtractor.extract(maskImage)
-        byteBuf.rewind()
+        val mH: Int
+        val mW: Int
+        val mC: Int
 
-        val rawBytes = ByteArray(mW * mH)
-        byteBuf.get(rawBytes)
-
-        // Determine outer perimeter background category value (almost always 0)
-        var zeroBorderCount = 0
-        var nonZeroBorderCount = 0
-        for (x in 0 until mW step 4) {
-            if ((rawBytes[x].toInt() and 0xFF) == 0) zeroBorderCount++ else nonZeroBorderCount++
-            if ((rawBytes[(mH - 1) * mW + x].toInt() and 0xFF) == 0) zeroBorderCount++ else nonZeroBorderCount++
+        when (outShape.size) {
+            4 -> {
+                if (outShape[3] <= 4) {
+                    mH = outShape[1]; mW = outShape[2]; mC = outShape[3]
+                } else {
+                    mC = outShape[1]; mH = outShape[2]; mW = outShape[3]
+                }
+            }
+            3 -> {
+                mH = outShape[1]; mW = outShape[2]; mC = 1
+            }
+            else -> return
         }
-        val bgCategoryIsZero = zeroBorderCount >= nonZeroBorderCount
 
-        // Downsample mask onto a fast 128x128 grid to extract the connected component under the keypoint
+        val scores = FloatArray(mW * mH)
+        if (outType == DataType.FLOAT32) {
+            val fb = outputBuffer.asFloatBuffer()
+            for (i in 0 until (mW * mH)) {
+                scores[i] = if (mC == 1) {
+                    fb.get(i)
+                } else {
+                    fb.get(i * mC + (mC - 1)) - fb.get(i * mC)
+                }
+            }
+        } else {
+            for (i in 0 until (mW * mH)) {
+                val base = i * mC + (mC - 1)
+                scores[i] = (outputBuffer.get(base).toInt() and 0xFF) / 255.0f
+            }
+        }
+
+        // Compare score around seed vs. outer border to calibrate threshold automatically
+        val seedX = (normKeyX * mW).toInt().coerceIn(8, mW - 9)
+        val seedY = (normKeyY * mH).toInt().coerceIn(8, mH - 9)
+        var seedSum = 0f; var seedCnt = 0
+        for (dy in -4..4) {
+            for (dx in -4..4) {
+                seedSum += scores[(seedY + dy) * mW + (seedX + dx)]
+                seedCnt++
+            }
+        }
+        val seedMean = seedSum / seedCnt
+
+        var borderSum = 0f; var borderCnt = 0
+        for (x in 0 until mW step 4) {
+            borderSum += scores[2 * mW + x] + scores[(mH - 3) * mW + x]
+            borderCnt += 2
+        }
+        val borderMean = borderSum / borderCnt.coerceAtLeast(1)
+
+        if (abs(seedMean - borderMean) < 0.04f) {
+            logDebug("ℹ️ MagicTouch low contrast — keeping 3D Ring lock")
+            return
+        }
+
+        val thresh = borderMean + (seedMean - borderMean) * 0.48f
+        val seedIsHigher = seedMean > borderMean
+
         val gSize = 128
         val gridMask = BooleanArray(gSize * gSize)
         for (gy in 1 until gSize - 1) {
@@ -1127,33 +1212,29 @@ class MainActivity : AppCompatActivity() {
             val rowOff = my * mW
             for (gx in 1 until gSize - 1) {
                 val mx = (gx * mW) / gSize
-                val v = rawBytes[rowOff + mx].toInt() and 0xFF
-                gridMask[gy * gSize + gx] = if (bgCategoryIsZero) (v > 0) else (v == 0)
+                val s = scores[rowOff + mx]
+                gridMask[gy * gSize + gx] = if (seedIsHigher) (s >= thresh) else (s <= thresh)
             }
         }
 
         val seedGX = (normKeyX * gSize).toInt().coerceIn(4, gSize - 5)
         val seedGY = (normKeyY * gSize).toInt().coerceIn(4, gSize - 5)
         var startIdx = -1
-        var bestSeedDist = Int.MAX_VALUE
-
-        for (gy in (seedGY - 12).coerceAtLeast(2)..(seedGY + 12).coerceAtMost(gSize - 3)) {
-            for (gx in (seedGX - 12).coerceAtLeast(2)..(seedGX + 12).coerceAtMost(gSize - 3)) {
+        var bestDist = Int.MAX_VALUE
+        for (gy in (seedGY - 10)..(seedGY + 10)) {
+            for (gx in (seedGX - 10)..(seedGX + 10)) {
                 val idx = gy * gSize + gx
                 if (gridMask[idx]) {
                     val d = (gx - seedGX) * (gx - seedGX) + (gy - seedGY) * (gy - seedGY)
-                    if (d < bestSeedDist) {
-                        bestSeedDist = d
+                    if (d < bestDist) {
+                        bestDist = d
                         startIdx = idx
                     }
                 }
             }
         }
 
-        if (startIdx == -1) {
-            logDebug("⚠️ MagicTouch mask had no foreground near seed")
-            return
-        }
+        if (startIdx == -1) return
 
         val visited = BooleanArray(gSize * gSize)
         val queue = ArrayDeque<Int>()
@@ -1191,18 +1272,16 @@ class MainActivity : AppCompatActivity() {
         }
 
         val count = fgScreenX.size
-        if (count < 25 || count > (gSize * gSize * 0.78f).toInt()) {
-            logDebug("⚠️ MagicTouch component out of bounds ($count cells) — keeping 3D Ring lock")
+        if (count < 30 || count > (gSize * gSize * 0.72f).toInt()) {
+            logDebug("ℹ️ Keeping 3D Ring Fit (MagicTouch mask count: $count)")
             return
         }
 
         val barX = sumX / count
         val barY = sumY / count
 
-        // 1° Rotating-Calipers Minimum-Area Bounding Box sweep on the neural mask
         var bestArea = Float.MAX_VALUE
         var bestRad = 0f
-
         for (deg in 0 until 90) {
             val rad = Math.toRadians(deg.toDouble()).toFloat()
             val c = cos(rad)
@@ -1336,8 +1415,8 @@ class MainActivity : AppCompatActivity() {
                 val currentAnchor = prismAnchor
                 if (session != null && currentAnchor != null) {
                     val curPose = currentAnchor.pose
-                    val deltaX = lCenter[0].coerceIn(-0.08f, 0.08f)
-                    val deltaZ = lCenter[2].coerceIn(-0.08f, 0.08f)
+                    val deltaX = (lCenter[0] * 0.5f).coerceIn(-0.06f, 0.06f)
+                    val deltaZ = (lCenter[2] * 0.5f).coerceIn(-0.06f, 0.06f)
                     val worldCenterNow = curPose.transformPoint(floatArrayOf(deltaX, 0f, deltaZ))
                     currentAnchor.detach()
                     val newCenterPose = Pose(
@@ -1351,8 +1430,8 @@ class MainActivity : AppCompatActivity() {
             }
 
             initialAzimuth = headingAngle
-            prismWidth = finalWidth
-            prismDepth = finalDepth
+            prismWidth = finalWidth * 0.65f + prismWidth * 0.35f
+            prismDepth = finalDepth * 0.65f + prismDepth * 0.35f
 
             updateScaleLabels()
             overlayView.postInvalidate()
