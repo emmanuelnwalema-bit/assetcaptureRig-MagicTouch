@@ -56,7 +56,7 @@ android {
         buildConfig = true
     }
 
-    // Critical for MediaPipe / TFLite: prevents APK compression so the model can be memory-mapped
+    // Prevents APK compression on .tflite files so MediaPipe can memory-map magic_touch.tflite
     androidResources {
         noCompress += listOf("tflite", "lite", "task")
     }
@@ -78,33 +78,6 @@ android {
             useLegacyPackaging = true
         }
     }
-}
-
-// Automatically downloads magic_touch.tflite into src/main/assets/ during build if missing
-tasks.register("downloadMagicTouchModel") {
-    doLast {
-        val assetsDir = file("src/main/assets")
-        if (!assetsDir.exists()) {
-            assetsDir.mkdirs()
-        }
-        val modelFile = file("src/main/assets/magic_touch.tflite")
-        if (!modelFile.exists() || modelFile.length() < 100_000L) {
-            println("Downloading magic_touch.tflite from Google MediaPipe storage...")
-            val modelUrl = "https://storage.googleapis.com/mediapipe-models/interactive_segmenter/magic_touch/float32/1/magic_touch.tflite"
-            java.net.URI(modelUrl).toURL().openStream().use { input ->
-                modelFile.outputStream().use { output ->
-                    input.copyTo(output)
-                }
-            }
-            println("✓ magic_touch.tflite downloaded (${modelFile.length() / 1024} KB)")
-        } else {
-            println("✓ magic_touch.tflite already present (${modelFile.length() / 1024} KB)")
-        }
-    }
-}
-
-tasks.named("preBuild") {
-    dependsOn("downloadMagicTouchModel")
 }
 
 dependencies {
