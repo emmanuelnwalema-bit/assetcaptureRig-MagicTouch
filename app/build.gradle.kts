@@ -16,7 +16,6 @@ android {
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
 
-        // Strips any accidental newlines, quotes, or spaces from the GitHub Secret
         val apiKey = (System.getenv("DASHSCOPE_API_KEY") ?: "")
             .replace("\n", "")
             .replace("\r", "")
@@ -56,9 +55,8 @@ android {
         buildConfig = true
     }
 
-    // Prevents APK compression on .tflite files so MediaPipe can memory-map magic_touch.tflite
     androidResources {
-        noCompress += listOf("tflite", "lite", "task")
+        noCompress += listOf("tflite", "lite")
     }
 
     packaging {
@@ -91,8 +89,8 @@ dependencies {
     implementation("com.google.ar:core:1.41.0")
     implementation("io.github.sceneview:arsceneview:2.2.1")
 
-    // MediaPipe Tasks Vision for InteractiveSegmenter (magic_touch.tflite)
-    implementation("com.google.mediapipe:tasks-vision:0.10.14")
+    // Lightweight TFLite runtime for magic_touch.tflite (zero dex conflicts with Sceneview)
+    implementation("org.tensorflow:tensorflow-lite:2.14.0")
 
     // Networking for Modal Batch Upload
     implementation("com.squareup.okhttp3:okhttp:4.12.0")
